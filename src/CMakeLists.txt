@@ -1,3 +1,4 @@
+# 生成KCACHE_CORE静态库
 # 收集核心源文件（排除 main.cpp 和 client 目录）
 file(GLOB_RECURSE KCACHE_CORE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 list(REMOVE_ITEM KCACHE_CORE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp")
@@ -25,7 +26,7 @@ set(GRPC_HDR_FILE ${PROTO_FILE_DIR}/kcache.grpc.pb.h) # gRPC 生成的 .h
 get_filename_component(PROTO_FILE "${PROTO_FILE_DIR}/kcache.proto" ABSOLUTE)
 get_filename_component(PROTO_FILE_PATH "${PROTO_FILE}" PATH)
 
-# 生成 *.pb.cc *.pb.h *.grpc.pb.h *.grpc.pb.cc
+# 生成 *.pb.cc *.pb.h *.grpc.pb.h *.grpc.pb.cc文件
 add_custom_command(
     COMMAND
         ${PROTOC_EXE} ARGS --grpc_out ${PROTO_FILE_DIR} --cpp_out
@@ -46,9 +47,10 @@ target_link_libraries(kcache_core PUBLIC
     fmt::fmt
     spdlog::spdlog
     protobuf::protobuf
-    grpc::grpc)
+    grpc::grpc
+    httplib::httplib)
 
-# node server
+# node server链接上方构造的kcache_core库，引入命令行参数解析库
 add_executable(node_server "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp")
 target_link_libraries(node_server
     kcache_core

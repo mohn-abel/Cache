@@ -16,50 +16,50 @@ using namespace kcache;
 class ConsistentHashTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        // Simple hash function for predictable testing
+        // Simple hash function for predictable testing，默认哈希环配置
         test_config_ = HashConfig{
-            3,   // replicas
-            1,   // min_replicas
-            10,  // max_replicas
-            std::hash<std::string>{},
+            3,   // replicas，虚拟节点数
+            1,   // min_replicas，最小虚拟节点数
+            10,  // max_replicas，最大虚拟节点数
+            std::hash<std::string>{}, // 哈希函数
             0.2  // load_balance_threshold
         };
     }
 
     HashConfig test_config_;
 };
-
+// 默认构造配置
 TEST_F(ConsistentHashTest, DefaultConstructor) {
     ConsistentHashMap hash_map;
 
     // Should work with default configuration
-    EXPECT_TRUE(hash_map.Add({"node1", "node2"}));
+    EXPECT_TRUE(hash_map.Add({"node1", "node2"})); // 给哈希环上添加两个真实节点
 
-    auto node = hash_map.Get("test_key");
-    EXPECT_TRUE(node == "node1" || node == "node2");
+    auto node = hash_map.Get("test_key"); // 随便查一个est_key缓存信息，看看哈希环将其分配在哪个节点
+    EXPECT_TRUE(node == "node1" || node == "node2"); // 节点1，2都有可能
 }
-
+// 自定义构造配置
 TEST_F(ConsistentHashTest, CustomConfigConstructor) {
-    ConsistentHashMap hash_map(test_config_);
+    ConsistentHashMap hash_map(test_config_); // 传入自定义哈希环配置
 
     EXPECT_TRUE(hash_map.Add({"node1"}));
     auto node = hash_map.Get("test_key");
     EXPECT_EQ(node, "node1");
 }
-
+// 基础存取测试
 TEST_F(ConsistentHashTest, BasicAddAndGet) {
     ConsistentHashMap hash_map(test_config_);
 
-    // Add nodes
+    // Add 3 nodes
     EXPECT_TRUE(hash_map.Add({"node1", "node2", "node3"}));
 
     // Test that Get returns one of the added nodes
     std::unordered_set<std::string> expected_nodes = {"node1", "node2", "node3"};
 
     for (int i = 0; i < 100; ++i) {
-        std::string key = "key" + std::to_string(i);
-        auto node = hash_map.Get(key);
-        EXPECT_TRUE(expected_nodes.count(node) > 0);
+        std::string key = "key" + std::to_string(i); // 构建key
+        auto node = hash_map.Get(key); // 获取所在节点
+        EXPECT_TRUE(expected_nodes.count(node) > 0); // 判断计算出的node在不在自定义哈希表中
     }
 }
 
@@ -76,11 +76,11 @@ TEST_F(ConsistentHashTest, ConsistentHashing) {
     for (int i = 0; i < 50; ++i) {
         std::string key = "key" + std::to_string(i);
         test_keys.push_back(key);
-        key_to_node[key] = hash_map.Get(key);
+        key_to_node[key] = hash_map.Get(key); // 将键绑定节点
     }
 
     // Add another node
-    EXPECT_TRUE(hash_map.Add({"node3"}));
+    EXPECT_TRUE(hash_map.Add({"node3"})); // 添加第三个节点，部分数据存储的节点需要发生变化
 
     // Check that most keys still map to the same nodes
     int unchanged_keys = 0;
@@ -101,7 +101,7 @@ TEST_F(ConsistentHashTest, RemoveNode) {
     EXPECT_TRUE(hash_map.Add({"node1", "node2", "node3"}));
 
     // Remove a node
-    EXPECT_TRUE(hash_map.Remove("node2"));
+    EXPECT_TRUE(hash_map.Remove("node2")); // node2下线
 
     // Verify node2 is no longer returned
     std::unordered_set<std::string> possible_nodes;
@@ -112,7 +112,7 @@ TEST_F(ConsistentHashTest, RemoveNode) {
     }
 
     EXPECT_EQ(possible_nodes.count("node2"), 0);
-    EXPECT_GT(possible_nodes.count("node1"), 0);
+    EXPECT_GT(possible_nodes.count("node1"), 0); // 判断.count是否大于0
     EXPECT_GT(possible_nodes.count("node3"), 0);
 }
 
@@ -122,7 +122,7 @@ TEST_F(ConsistentHashTest, RemoveNonExistentNode) {
     EXPECT_TRUE(hash_map.Add({"node1"}));
 
     // Removing non-existent node should handle gracefully
-    bool result = hash_map.Remove("nonexistent");
+    bool result = hash_map.Remove("nonexistent"); // 删除不存在的机器
     // The behavior may vary based on implementation
     // Just ensure it doesn't crash
 
@@ -135,7 +135,7 @@ TEST_F(ConsistentHashTest, EmptyHashMap) {
     ConsistentHashMap hash_map(test_config_);
 
     // Getting from empty hash map should return empty string or handle gracefully
-    auto node = hash_map.Get("test_key");
+    auto node = hash_map.Get("test_key"); // 空载查询
     // Implementation may return empty string or throw
     // Just ensure it doesn't crash
 }
@@ -149,20 +149,20 @@ TEST_F(ConsistentHashTest, LoadBalanceDistribution) {
     // Generate many requests to test load distribution
     std::unordered_map<std::string, int> node_counts;
     int total_requests = 10000;
-
+    // 执行10000次访问
     for (int i = 0; i < total_requests; ++i) {
         std::string key = "key" + std::to_string(i);
         auto node = hash_map.Get(key);
-        node_counts[node]++;
+        node_counts[node]++; // 记录各个节点的访问次数
     }
 
     // Check that load is reasonably distributed
-    EXPECT_EQ(node_counts.size(), 3);
+    EXPECT_EQ(node_counts.size(), 3); // 确定三个节点都被访问过
 
     for (const auto& [node, count] : node_counts) {
-        double load_ratio = static_cast<double>(count) / total_requests;
+        double load_ratio = static_cast<double>(count) / total_requests; // 计算各个节点负载
         // Each node should get roughly 1/3 of the load, allow some variance
-        EXPECT_GT(load_ratio, 0.2);
+        EXPECT_GT(load_ratio, 0.2); // 期望负载在0.2-0.5之间
         EXPECT_LT(load_ratio, 0.5);
     }
 }
@@ -178,10 +178,10 @@ TEST_F(ConsistentHashTest, GetStats) {
     }
 
     // Get statistics
-    auto stats = hash_map.GetStats();
+    auto stats = hash_map.GetStats(); // 获取各节点负载状况
 
     // Should have stats for both nodes
-    EXPECT_TRUE(stats.count("node1") > 0 || stats.count("node2") > 0);
+    EXPECT_TRUE(stats.count("node1") > 0 || stats.count("node2") > 0); 
 
     // Stats should be reasonable (between 0 and 1)
     for (const auto& [node, ratio] : stats) {
@@ -189,47 +189,50 @@ TEST_F(ConsistentHashTest, GetStats) {
         EXPECT_LE(ratio, 1.0);
     }
 }
-
+// 多线程并发读写测试
 TEST_F(ConsistentHashTest, ThreadSafety) {
     ConsistentHashMap hash_map(test_config_);
 
     EXPECT_TRUE(hash_map.Add({"node1", "node2", "node3"}));
 
-    std::atomic<int> successful_gets{0};
-    std::atomic<bool> stop_flag{false};
+    std::atomic<int> successful_gets{0}; // 原子计数器，自带锁
+    std::atomic<bool> stop_flag{false}; // 自带锁
 
     // Start multiple reader threads
     std::vector<std::thread> readers;
+    // 设置4个线程读取
     for (int i = 0; i < 4; ++i) {
         readers.emplace_back([&hash_map, &successful_gets, &stop_flag, i]() {
+            // 4个线程持续读取，直到关闭
             while (!stop_flag.load()) {
                 std::string key = "thread" + std::to_string(i) + "_key" + std::to_string(successful_gets.load());
                 auto node = hash_map.Get(key);
                 if (!node.empty()) {
                     successful_gets++;
                 }
-                std::this_thread::sleep_for(std::chrono::microseconds(10));
+                std::this_thread::sleep_for(std::chrono::microseconds(10)); // 设置并发空窗期
             }
         });
     }
 
     // Start a writer thread
+    // 在四个读线程中添加一个写线程
     std::thread writer([&hash_map, &stop_flag]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        hash_map.Add({"node4"});
+        hash_map.Add({"node4"}); // 隔一会添加节点4，数据存在的节点会发生变化
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        hash_map.Remove("node4");
-        stop_flag.store(true);
+        hash_map.Remove("node4"); // 再删除节点4，又将发生变化，这之中4个读线程是不断运行的
+        stop_flag.store(true); // 停止读线程
     });
 
-    writer.join();
+    writer.join(); // 主线程调用join，所以主线程需等待writer线程结束
     for (auto& reader : readers) {
-        reader.join();
+        reader.join(); // 同样主线程需等待所有reader线程结束
     }
 
-    EXPECT_GT(successful_gets.load(), 0);
+    EXPECT_GT(successful_gets.load(), 0); // 程序未崩溃并且运行到此步骤则说明锁机制成功，线程很安全
 }
-
+// 分批添加节点
 TEST_F(ConsistentHashTest, MultipleAddOperations) {
     ConsistentHashMap hash_map(test_config_);
 
@@ -252,7 +255,7 @@ TEST_F(ConsistentHashTest, MultipleAddOperations) {
     EXPECT_TRUE(found_nodes.count("node3") > 0);
     EXPECT_TRUE(found_nodes.count("node4") > 0);
 }
-
+// 重复添加节点
 TEST_F(ConsistentHashTest, DuplicateNodeAddition) {
     ConsistentHashMap hash_map(test_config_);
 
@@ -284,7 +287,7 @@ TEST_F(ConsistentHashTest, SpecificHashBehavior) {
         if (key == "4_0") return 4;
         if (key == "6_0") return 6;
         if (key == "8_0") return 8;
-        return std::hash<std::string>{}(key);
+        return std::hash<std::string>{}(key); // 除了以上特定的值，其他都按照默认的取模哈希
     };
 
     ConsistentHashMap hash_map(simple_config);
@@ -300,7 +303,7 @@ TEST_F(ConsistentHashTest, SpecificHashBehavior) {
     node = hash_map.Get("11");
     EXPECT_FALSE(node.empty());
 }
-
+// 极端的虚拟节点数不会导致崩溃
 TEST_F(ConsistentHashTest, ConfigValidation) {
     // Test with extreme configurations
     HashConfig extreme_config = test_config_;
@@ -314,7 +317,7 @@ TEST_F(ConsistentHashTest, ConfigValidation) {
     auto node = hash_map.Get("test_key");
     EXPECT_EQ(node, "node1");
 }
-
+// 长效负载动态平衡
 TEST_F(ConsistentHashTest, LongRunningBalancer) {
     ConsistentHashMap hash_map(test_config_);
 
@@ -341,6 +344,7 @@ TEST_F(ConsistentHashTest, LongRunningBalancer) {
 }
 
 // Test destructor behavior - ensure balancer thread stops properly
+// 测试析构函数
 TEST_F(ConsistentHashTest, DestructorTest) {
     {
         ConsistentHashMap hash_map(test_config_);
@@ -350,7 +354,7 @@ TEST_F(ConsistentHashTest, DestructorTest) {
         for (int i = 0; i < 100; ++i) {
             hash_map.Get("key" + std::to_string(i));
         }
-
+        // 退出代码块自动析构
         // hash_map will be destroyed here
     }
 

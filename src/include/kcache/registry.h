@@ -10,6 +10,7 @@ namespace kcache {
 
 class EtcdRegistry {
 public:
+    // 构造函数：etcd 的默认客户端端口
     EtcdRegistry(const std::string& endpoints = "http://127.0.0.1:2379") {
         etcd_client_ = std::make_unique<etcd::Client>(endpoints);
     }
@@ -23,15 +24,16 @@ public:
     void Unregister();
 
 private:
+    // 辅助函数：启动时没有指定IP，自动获取本机的网卡IP
     auto GetLocalIP() -> std::string;
 
-    void KeepAliveLoop();
+    void KeepAliveLoop(); // 后台心跳循环
 
-    int64_t lease_id_{0};
-    std::unique_ptr<etcd::Client> etcd_client_;
+    int64_t lease_id_{0}; // 租约ID
+    std::unique_ptr<etcd::Client> etcd_client_; // 独占的etcd进程指针
     std::string key_;
-    std::thread keepalive_thread_;
-    std::atomic<bool> is_stop_{false};
+    std::thread keepalive_thread_; // 后台心跳进程
+    std::atomic<bool> is_stop_{false}; // 停机标志
 };
 
 }  // namespace kcache

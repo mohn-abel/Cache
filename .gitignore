@@ -1,18 +1,40 @@
-# Xmake cache
-.xmake/
-
+# Build artifacts
 build/
 bin/
-CMakeUserPresets.json
+*.o
+*.so
+*.a
 
-# MacOS Cache
+# CMake
+CMakeUserPresets.json
+CMakePresets.json
+*.bak
+
+# Conan
+conan_imports/
+conan_export/
+
+# IDE / Editor
+.vscode/
+.codex
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
 .DS_Store
 
-# Vscode Cache
-.vscode/
-
-# gRPC and Protobuf
+# gRPC and Protobuf generated
 *.pb.cc
 *.pb.h
 *.grpc.pb.cc
 *.grpc.pb.h
+
+# Benchmark / test data
+bench*.json
+warmup*.json
+
+# Images (not docs)
+*.png
+*.jpg

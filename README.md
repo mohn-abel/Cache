@@ -2,195 +2,179 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kerolt/kcache)
 
-KCache 是一个类似 Memcached 的分布式缓存系统，采用客户端-服务器架构。系统基于一致性哈希算法实现数据分片和负载均衡，使用 LRU（最近最少使用）缓存淘汰算法。节点间通过 gRPC 进行高效通信，基于 etcd 实现服务注册与发现。
+KCache 是一个类 Memcached 的分布式缓存系统，采用 C/S 架构，基于一致性哈希实现数据分片，使用 LRU 淘汰算法。节点间通过 gRPC 通信，基于 etcd 实现服务注册与发现。
 
-与 Memcached 类似，KCache 提供了独立的客户端 SDK，应用程序通过 SDK 直接与缓存集群交互。同时提供了 HTTP 网关作为示例，展示如何基于 SDK 构建 REST API 服务。该项目使用 Conan 作为包管理工具，使用 CMake 作为构建工具。
+## 特性
+
+- **分布式路由** — 一致性哈希 + 虚拟节点 + 自适应负载均衡，节点增减时最小化数据迁移
+- **防缓存击穿** — SingleFlight 合并并发请求，同一 key 只回源一次
+- **熔断降级** — 三态熔断器 (Closed→Open→HalfOpen)，回源失败时自动走 Fallback 或返回过期缓存
+- **TTL 过期** — 支持写入时指定过期时间，Get 时惰性删除
+- **可观测性** — Prometheus 指标端点，暴露命中率、熔断状态、加载耗时等 15 项指标
+- **资源保护** — gRPC 超时控制、连接池复用、KeepAlive 探活、并发流限流
+- **强一致性** — Set 时广播 Invalidate 到其他节点，Delete 时全节点广播
 
 ## 运行环境
 
 - Ubuntu 22.04 (Docker)
-- GCC 11.4 (use C++ 17)
-- CMake 3.22.1
-- Conan 2.16.1
+- GCC 11.4（C++17）
+- CMake 3.22+
+- Conan 2.x
 
 ## 项目依赖
 
-- gflags / 2.2.2
-- gtest / 1.16.0
-- protobuf / 3.21.12
-- grpc / 1.54.3
-- etcd-cpp-apiv3 / 0.15.4
-- fmt / 11.1.3
-- spdlog / 1.15.1
-- cpp-httplib / 0.20.1
-- nlohmann_json / 3.12.0
+| 库 | 版本 | 用途 |
+|---|---|---|
+| gflags | 2.2.2 | 命令行参数 |
+| gtest | 1.16.0 | 单元测试 |
+| protobuf | 3.21.12 | 序列化 |
+| grpc | 1.54.3 | RPC 通信 |
+| etcd-cpp-apiv3 | 0.15.4 | etcd 客户端 |
+| fmt | 11.1.3 | 字符串格式化 |
+| spdlog | 1.15.1 | 日志 |
+| cpp-httplib | 0.20.1 | HTTP 服务 |
+| nlohmann_json | 3.12.0 | JSON 解析 |
 
-该项目使用 [conan](https://conan.io/) 作为依赖管理工具，在配置该项目时需确保当前系统上安装了 conan。
+> 使用 Conan 作为包管理器。注意 `etcd-cpp-apiv3` 依赖 `libsystemd/255`，该版本在高版本内核 (>6.8) 有 bug，推荐在 Docker 或内核 ≤6.8 的环境构建。
 
-> 项目 v2 版本不使用 vcpkg 了是因为其无法下载 etcd-cpp-apiv3，为了方便管理第三方库就只使用了 conan。
-
-## 架构设计
-
-KCache 采用客户端-服务器架构，类似于 Memcached：
+## 架构
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   客户端1    │     │   客户端2    │     │  HTTP网关   │
-│ (使用 SDK)  │     │ (使用 SDK)  │     │ (基于 SDK)  │
-└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
-       │                   │                   │
-       │ ┌─────────────────┴───────────────────┘
-       │ │          一致性哈希路由 + 服务发现
-       │ │                   │
-       └─┴───────────────────┴─────────────────┐
-         │                                     │
-    ┌────▼────┐         ┌────────┐       ┌────▼────┐
-    │ Node A  │◄────────┤  etcd  ├──────►│ Node C  │
-    │ (gRPC)  │         │(注册中心)│       │ (gRPC)  │
-    └────┬────┘         └────────┘       └────┬────┘
-         │                                     │
-         └──────────────►┌────────┐◄───────────┘
-                        │ Node B  │
-                        │ (gRPC)  │
-                        └─────────┘
+┌──────────┐     ┌──────────┐     ┌──────────┐
+│  客户端1   │     │  客户端2   │     │ HTTP 网关 │
+│ (SDK)    │     │ (SDK)    │     │ (SDK)    │
+└────┬─────┘     └────┬─────┘     └────┬─────┘
+     │                 │                 │
+     └─────────────────┼─────────────────┘
+                       │  一致性哈希路由
+                       │
+     ┌─────────────────┼─────────────────┐
+     │                 │                 │
+┌────▼────┐       ┌────▼────┐       ┌────▼────┐
+│ Node A  │◄──────┤  etcd   ├──────►│ Node C  │
+│ (gRPC)  │       │ 注册中心  │       │ (gRPC)  │
+└────┬────┘       └─────────┘       └────┬────┘
+     │                                    │
+     └──────────────►┌────────┐◄──────────┘
+                    │ Node B  │
+                    │ (gRPC)  │
+                    └────────┘
 ```
 
-### 数据流程
+### 请求流程
 
-**GET 请求：**
-1. 客户端/网关通过 SDK 使用一致性哈希确定目标节点
-2. 向目标节点发送 gRPC Get 请求
-3. 节点首先检查本地 LRU 缓存
-4. 若缓存未命中，从数据源加载（通过 Getter 回调）
-5. 将数据存入本地缓存并返回给客户端
+**GET 流程：**
 
-**SET 请求（强一致性）：**
-1. 客户端/网关通过一致性哈希确定主节点
-2. 向主节点发送 gRPC Set 请求写入数据
-3. 并发向其他所有节点发送 Invalidate 请求（缓存失效）
-4. 所有节点完成后返回成功
+```
+用户请求
+  → 本地 LRU 缓存（命中直接返回）
+  → SingleFlight 防击穿（同一 key 只允许一个线程回源）
+  → 熔断检查（触发熔断则走 Fallback 降级）
+  → gRPC 请求远程节点
+  → 回源数据库（getter 回调）
+  → 写入本地缓存并返回
+```
 
-**DELETE 请求：**
-1. 客户端/网关向所有节点广播 Delete 请求
-2. 各节点删除本地缓存
-3. 全部完成后返回成功
+**SET 流程：**
 
-## 设计理念
+```
+用户写入
+  → 一致性哈希定位主节点
+  → gRPC Set 写入主节点
+  → 并发 Invalidate 广播到其余所有节点（使过期缓存失效）
+  → 全部成功返回
+```
 
-KCache 的设计灵感来源于：
-- **Memcached**：采用客户端-服务器架构，提供独立的客户端 SDK
-- **GroupCache**：借鉴了 Group、SingleFlight 等概念，实现缓存穿透防护
+**DELETE 流程：**
 
-与 GroupCache 的主要区别：
-- GroupCache 是嵌入式缓存库，节点间自动协调；KCache 是独立服务，通过 SDK 访问
-- GroupCache 只读缓存；KCache 支持完整的 CRUD 操作
-- KCache 提供了更灵活的客户端集成方式
-
-## 致谢
-
-1. 本项目参考了 [geektutu/7days-golang](https://github.com/geektutu/7days-golang) 项目，感谢其作者提供的 [教程](https://geektutu.com/post/geecache.html) 和代码示例。
-2. 项目第二版参考了[【代码随想录知识星球】项目分享-缓存系统（Go）](https://github.com/youngyangyang04/KamaCache-Go)
+```
+用户删除
+  → 向所有存活节点广播 Delete
+  → 各节点删除本地缓存
+  → 全部完成返回
+```
 
 ## 项目结构
 
 ```
 .
-├── include/kcache          # 公共头文件（客户端 SDK）
-│   └── client.h           # KCacheClient SDK 接口
+├── include/kcache/              # SDK 公共头文件
+│   └── client.h                 # KCacheClient 接口
 ├── src/
-│   ├── cache/             # LRU 缓存实现
-│   ├── client/            # 客户端 SDK 实现
-│   │   └── client_sdk.cpp
-│   ├── consistent_hash/   # 一致性哈希
-│   ├── group/             # 缓存组（逻辑命名空间）
-│   ├── peer/              # 节点间通信（gRPC 客户端）
-│   ├── server/            # gRPC 服务器
-│   ├── registry/          # etcd 服务注册
-│   ├── proto/             # Protobuf 定义
-│   │   └── kcache.proto
-│   ├── include/kcache/    # 内部头文件
-│   └── main.cpp           # 缓存节点入口
+│   ├── cache/lru.cpp            # LRU 缓存（TTL、淘汰回调）
+│   ├── client/client_sdk.cpp    # 客户端 SDK（服务发现、路由、熔断器池）
+│   ├── consistent_hash/         # 一致性哈希（虚拟节点、自适应负载均衡）
+│   ├── group/group.cpp          # 缓存组（Get/Set/Delete、Fallback）
+│   ├── server/server.cpp        # gRPC 服务端（Prometheus 指标、安全加固）
+│   ├── registry/registry.cpp    # etcd 服务注册（lease 心跳）
+│   ├── proto/kcache.proto       # gRPC 协议定义
+│   ├── include/kcache/
+│   │   ├── cache.h              # ByteView + LRUCache 声明
+│   │   ├── circuit_breaker.h    # 熔断器（三态流转）
+│   │   ├── consistent_hash.h    # 一致性哈希声明
+│   │   ├── group.h              # KCacheGroup 声明
+│   │   ├── server.h             # KCacheServer 声明
+│   │   ├── registry.h           # EtcdRegistry 声明
+│   │   └── singleflight.h       # 防缓存击穿
+│   └── main.cpp                 # 缓存节点入口
 ├── example/
-│   └── http_gateway/      # HTTP 网关示例（基于 SDK）
-├── test/                  # 单元测试
-│   ├── test_lru.cpp
-│   ├── test_consistent_hash.cpp
-│   └── test_group.cpp
+│   └── http_gateway/            # HTTP REST 网关示例
+│       └── http_gateway.cpp
+├── test/
+│   ├── test_lru.cpp             # LRU + TTL 测试
+│   ├── test_consistent_hash.cpp # 一致性哈希测试
+│   ├── test_group.cpp           # 缓存组 + SingleFlight 测试
+│   └── test_circuit_breaker.cpp # 熔断器三态转换测试
+├── Dockerfile
+├── docker-compose.yml
 ├── CMakeLists.txt
 ├── conanfile.txt
-└── README.md
+└── LICENSE
 ```
 
-### 核心模块
+## 构建与运行
 
-- **kcache_core**：核心业务逻辑库（缓存、哈希、组管理、服务器等）
-- **kcache_client_sdk**：客户端 SDK 库，封装服务发现、路由、通信
-- **node_server**：缓存节点可执行程序
-- **http_gateway**：HTTP 网关示例（展示如何使用 SDK）
-
-## 本地运行
-
-项目中使用的第三方库 `etcd-cpp-apiv3` 中依赖的 `libsystemd/255`，而这个版本的 libsystemd 在高版本的 Linux Kernel 上有一个 bug：
-
-```plain
-Unknown filesystems defined in kernel headers:
-
-Filesystem found in kernel header but not in filesystems-gperf.gperf: BCACHEFS_SUPER_MAGIC
-Filesystem found in kernel header but not in filesystems-gperf.gperf: PID_FS_MAGIC
-```
-
-不过后面这个 bug 修复了，可以看[这里](https://lore.kernel.org/buildroot/ZmGjGvRCN3GwWFhp@landeda/T/)。而我们使用的 Conan 仓库中 etcd-cpp-apiv3 的最新版本还是依赖了 libsystemd/255。
-
-因此如果继续使用 Conan 作为包管理器的话，就需要使用低版本的内核（6.8及以下），这里我使用的是 Ubuntu22.04，内核版本为 5.15，可以使用虚拟机或者 Docker。项目给出了 Dockerfile，能比较方便的构建出镜像，这里在下一章会有说明。
-
-### 项目构建
-
-1. 使用 conan 的 CMake 配置:
-
-    在项目根目录下执行：
-
-    ```sh
-    conan install . --build=missing -s build_type=<Debug|Release>
-    ```
-
-    Debug 和 Release 取决于你的选择。
-
-2. 配置项目：
-
-    ```sh
-    # cmake >= 3.23 
-    cmake --preset conan-debug
-    # cmake < 3.23
-    cmake -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Debug -S . -B build -G Ninja
-    ```
-
-    可按照你的需求将命令中的 debug(Debug) 换成 release(Release)
-
-3. 构建项目：
-
-    ```sh
-    cmake --build build -j
-    ```
-
-完成后，在 `src/proto` 目录下会生成 Protobuf 相关文件，在 `bin/` 目录下会生成可执行程序：
-
-- `node_server`：缓存节点程序
-- `http_gateway`：HTTP 网关程序（示例）
-- `test_*`：单元测试程序
-
-### 启动 etcd
+### 1. 安装依赖
 
 ```sh
-docker run -d --name etcd \ 
-        -p 2379:2379 \
-        quay.io/coreos/etcd:v3.5.0 \
-        etcd --advertise-client-urls http://0.0.0.0:2379 \
-        --listen-client-urls http://0.0.0.0:2379
+conan install . --build=missing -s build_type=Release
 ```
 
-### 运行
+### 2. 配置项目
 
-在不同终端启动缓存节点：
+```sh
+cmake --preset conan-release
+```
+
+### 3. 编译
+
+```sh
+cmake --build --preset conan-release -j
+```
+
+> 如果 CMake < 3.23，`--preset` 可能不生效，使用：
+> ```sh
+> cmake -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake \
+>       -DCMAKE_BUILD_TYPE=Release -S . -B build -G Ninja
+> cmake --build build -j
+> ```
+
+编译产物在 `bin/` 目录：
+- `node_server` — 缓存节点
+- `http_gateway` — HTTP 网关
+- `test_lru` / `test_consistent_hash` / `test_group` / `test_circuit_breaker` — 测试
+
+### 3. 启动 etcd
+
+```sh
+docker run -d --name etcd \
+  -p 2379:2379 \
+  quay.io/coreos/etcd:v3.5.0 \
+  etcd --advertise-client-urls http://0.0.0.0:2379 \
+       --listen-client-urls http://0.0.0.0:2379
+```
+
+### 4. 启动缓存节点
 
 ```sh
 ./bin/node_server --port=8001 --node=A
@@ -198,166 +182,221 @@ docker run -d --name etcd \
 ./bin/node_server --port=8003 --node=C
 ```
 
-启动 HTTP 网关（可选，也可以直接使用 SDK）：
+### 5. 启动 HTTP 网关（可选）
 
 ```sh
 ./bin/http_gateway --http_port=9000
 ```
 
-## Docker 运行
+## Docker 部署
 
-### 构建镜像  
-
-```sh
-docker build -t kcache:latest .  
-```
-
-> PS：如果构建时间长或者失败，可以考虑使用本地网络和代理：  
-> `docker build --network host --build-arg HTTP_PROXY=http://your-proxy:port --build-arg HTTPS_PROXY=http://your-proxy:port -t kcache:latest .`
-
-构建镜像时需要安装依赖，编译第三方库，可以喝杯☕慢慢等待~
-
-### 单节点运行  
-
-**启动 etcd**： 
-
-可以使用 Go 版本文档中 etcd 的启动方式：  
+### 构建镜像
 
 ```sh
-docker run -d --name etcd   
-  -p 2379:2379   
-  quay.io/coreos/etcd:v3.5.0   
-  etcd --advertise-client-urls http://0.0.0.0:2379   
-  --listen-client-urls http://0.0.0.0:2379  
+docker build -t kcache:latest .
 ```
 
-也可以在自己电脑上安装 etcd 来启动。  
-
-**启动一个 kcache node**：
+### 单节点
 
 ```sh
-docker run -d   
-  --name kcache-node   
-  -p 8001:8001   
-  --network host   
-  kcache:latest   
-  /app/bin/node_server --port=8001 --node=A
+docker run -d \
+  --name kcache-node \
+  --network host \
+  kcache:latest \
+  /app/bin/node_server --port=8001 --node=A
 ```
 
-### 多节点集群  
-
-使用 Docker Compose 一键启动集群。其中有三个节点，还有一个使用 client sdk 构建的示例网关。
+### 集群一键启动
 
 ```sh
-# 启动整个集群（包含 etcd + 3个节点 + 网关）  
-docker compose up -d  
+docker compose up -d
 ```
 
-可以通过 ps 查看服务状态， log 命令查看节点和网关的日志：  
+启动 5 个容器：`kcache-etcd` + `kcache-node-a/b/c` + `kcache-gateway`。
 
 ```sh
-# 查看服务状态  
-docker compose ps  
-
-# 查看日志  
-docker compose logs -f  
+docker compose ps          # 查看状态
+docker compose logs -f     # 查看日志
+docker compose down        # 停止并清理
 ```
 
-结束任务，删除容器：  
+## HTTP API
+
+网关提供 REST 接口，监听 `0.0.0.0:9000`：
+
+### GET — 获取缓存
 
 ```sh
-# 停止服务  
-docker compose down  
+curl http://localhost:9000/api/cache/default/Tom
+# → {"group":"default","key":"Tom","value":"400"}
 ```
+
+### POST — 写入缓存
+
+```sh
+curl -X POST http://localhost:9000/api/cache/default/Kerolt \
+  -d '{"value":"1219"}'
+# → {"group":"default","key":"Kerolt","success":true,"value":"1219"}
+```
+
+### DELETE — 删除缓存
+
+```sh
+curl -X DELETE http://localhost:9000/api/cache/default/Kerolt
+# → {"deleted":true,"group":"default","key":"Kerolt"}
+```
+
+## 命令行参数
+
+### node_server
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--port` | 8001 | 节点 gRPC 端口 |
+| `--node` | A | 节点标识符 |
+| `--group` | default | 缓存组名称 |
+| `--etcd_endpoints` | http://127.0.0.1:2379 | etcd 地址 |
+| `--getter_timeout_ms` | 3000 | getter 超时（ms），0=不超时 |
+| `--metrics_port` | 0 | Prometheus 指标端口，0=禁用 |
+| `--cache_ttl_ms` | 0 | 缓存 TTL（ms），0=永不过期 |
+| `--log_level` | info | 日志级别 |
+
+### http_gateway
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--http_port` | 9000 | HTTP 监听端口 |
+| `--etcd_endpoints` | http://127.0.0.1:2379 | etcd 地址 |
+| `--service_name` | kcache | 缓存服务名 |
+
+## Prometheus 指标
+
+启用 `--metrics_port=8080` 后，访问 `http://localhost:8080/metrics` 暴露以下指标：
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `kcache_local_hits` | Counter | 本地缓存命中 |
+| `kcache_local_misses` | Counter | 本地缓存未命中 |
+| `kcache_peer_hits` | Counter | 远端节点命中 |
+| `kcache_peer_misses` | Counter | 远端节点未命中 |
+| `kcache_loader_hits` | Counter | 回源成功 |
+| `kcache_loader_errors` | Counter | 回源失败 |
+| `kcache_circuit_breaks` | Counter | 熔断触发次数 |
+| `kcache_fallback_hits` | Counter | 降级命中次数 |
+| `kcache_getter_timeouts` | Counter | getter 超时次数 |
+| `kcache_hit_ratio` | Gauge | 命中率 |
+| `kcache_avg_load_duration_ms` | Gauge | 平均加载耗时 |
+| `kcache_circuit_breaker_state` | Gauge | 熔断器状态 (0=Closed, 1=Open, 2=HalfOpen) |
+| `kcache_cache_bytes` | Gauge | 当前缓存占用 |
+| `kcache_cache_max_bytes` | Gauge | 缓存容量上限 |
+| `kcache_cache_count` | Gauge | 缓存条目数 |
 
 ## 核心组件
 
-### 客户端 SDK (KCacheClient)
-
-独立的客户端库，提供与缓存集群交互的统一接口：
+### 客户端 SDK
 
 ```cpp
-// 初始化客户端
-KCacheClient client("http://127.0.0.1:2379", "kcache");
+#include "kcache/client.h"
 
-// 基本操作
-auto value = client.Get("group_name", "key");  // 获取缓存
-client.Set("group_name", "key", "value");      // 设置缓存
-client.Delete("group_name", "key");             // 删除缓存
+// 初始化（支持自定义熔断配置、RPC 超时、并发流限制）
+CircuitBreakerConfig cb_cfg;
+cb_cfg.failure_threshold = 5;
+cb_cfg.recovery_timeout_ms = 5000;
+
+KCacheClient client(
+    "http://127.0.0.1:2379",           // etcd 地址
+    "kcache",                            // 服务名
+    cb_cfg,                              // 熔断配置
+    std::chrono::milliseconds{200},      // RPC 超时
+    256                                  // 最大并发流
+);
+
+auto value = client.Get("default", "Tom");      // 获取
+client.Set("default", "Tom", "value");           // 写入
+client.Delete("default", "Tom");                 // 删除
 ```
 
-**核心功能：**
-- 自动服务发现（通过 etcd watch 实时更新节点列表）
-- 一致性哈希路由（智能选择目标节点）
-- 连接池管理（复用 gRPC 连接）
-- 强一致性保证（Set 时自动广播失效，Delete 时全节点删除）
+### 熔断器
 
-### 缓存节点 (Node Server)
+三态流转，防止雪崩：
 
-每个节点是独立的缓存服务器：
+- **Closed** — 正常状态。滑动窗口内累计失败达 `failure_threshold` 次后进入 Open
+- **Open** — 拒绝所有请求。等待 `recovery_timeout_ms` 后自动过渡到 HalfOpen
+- **HalfOpen** — 放行最多 `half_open_max_calls` 个探测请求。探测成功 `success_threshold` 次则恢复 Closed，任一失败则重新 Open
 
-**功能：**
-- 提供 gRPC 服务端接口（Get/Set/Delete/Invalidate）
-- 管理本地 LRU 缓存
-- 启动时自动注册到 etcd
-- 响应客户端请求并执行缓存操作
+```cpp
+CircuitBreakerConfig cfg;
+cfg.failure_threshold        = 5;     // 5 次失败触发熔断
+cfg.recovery_timeout_ms      = 5000;  // 5 秒后尝试恢复
+cfg.half_open_max_calls      = 2;     // 半开期最多 2 个探测请求
+cfg.success_threshold        = 2;     // 2 次成功关闭熔断
+cfg.failure_reset_timeout_ms = 10000; // 失效计数过期窗口
+```
 
-**内部组件：**
-- **Group**：缓存的逻辑命名空间，支持多租户隔离
-- **LRU Cache**：线程安全的本地缓存，自动淘汰最少使用数据
-- **SingleFlight**：防止缓存击穿，同一 key 的并发请求合并为一次加载
+### SingleFlight
+
+防止缓存击穿——同一 key 的并发请求只回源一次，其他请求等待并共享结果。支持等待超时、失败冷却期，避免故障 key 反复创建线程。
 
 ### 一致性哈希
 
-客户端使用一致性哈希算法将 key 映射到节点：
+- CRC32 IEEE 哈希函数（兼容 Go `crc32.ChecksumIEEE`）
+- 虚拟节点机制，可配置 replica 数范围
+- 后台线程监控负载，超过 25% 不均衡时自适应调整虚拟节点
+- 线程安全（`shared_mutex` + 原子计数器）
 
-- 虚拟节点机制确保负载均衡
-- 节点变化时最小化数据迁移
-- 支持动态负载调整
+### Fallback 降级
 
-### 服务注册与发现
+回源失败时按优先级降级：
+1. 返回 stale_cache（过期缓存）
+2. 调用 fallback getter（用户自定义降级函数）
+3. 返回空
 
-基于 etcd 实现：
+## 压测
 
-- 节点启动时注册自己的地址到 etcd
-- 客户端通过 etcd watch 实时感知节点变化
-- 节点下线时自动从集群中移除
-
-### HTTP 网关（可选）
-
-基于 SDK 实现的 REST API 网关，展示如何集成客户端库：
-
-- 将 HTTP 请求转换为 SDK 调用
-- 提供标准的 REST API 接口
-- 可作为参考实现集成到现有应用
-
-
-## 使用 curl 访问示例网关
-
-启动服务后，可以通过本机的 9000 端口来访问服务：  
-
-1. Get  
+单节点 gRPC Get 压测（使用 [ghz](https://ghz.sh/)）：
 
 ```sh
-curl http://127.0.0.1:9000/api/cache/default/Kerolt  
-# 输出：{"group":"test","key":"Kerolt","value":"370"}⏎  
+ghz --insecure \
+  --proto ./src/proto/kcache.proto \
+  --call kcache.pb.KCache/Get \
+  --data '{"group":"default","key":"Tom"}' \
+  --connections=4 --concurrency=128 \
+  --duration=60s --skipFirst=1000 \
+  localhost:8001
 ```
 
-2. Set  
+**结果摘要：**
+
+```
+Count:        1,062,812
+Total:        60.01 s
+Requests/sec: 17,710
+Average:      5.29 ms
+p50:          4.74 ms
+p99:          15.69 ms
+```
+
+并发梯度测试：
 
 ```sh
-$ curl -X POST http://127.0.0.1:9000/api/cache/default/Kerolt -d 'value=1219'     
-# 输出：{"group":"test","key":"Kerolt","success":true,"value":"value=1219"}⏎  
+for c in 16 32 64 128 256 512; do
+  ghz --insecure \
+    --proto ./src/proto/kcache.proto \
+    --call kcache.pb.KCache/Get \
+    --data '{"group":"default","key":"Tom"}' \
+    --connections=4 --concurrency=$c \
+    --duration=60s --skipFirst=1000 \
+    localhost:8001
+done
 ```
 
-3. Delete
+## 设计借鉴
 
-```sh
-$ curl -X DELETE http://localhost:9000/api/cache/default/Kerolt  
-# 输出：{"deleted":true,"group":"test","key":"Kerolt"}⏎  
-```
-
+- [Memcached](https://memcached.org/) — C/S 架构、客户端 SDK
+- [GroupCache](https://github.com/golang/groupcache) — Group 概念、SingleFlight
+- [7days-golang](https://github.com/geektutu/7days-golang) — 分布式缓存教程
+- [KamaCache-Go](https://github.com/youngyangyang04/KamaCache-Go) — 本项目 Go 语言参考实现
 
 ## 许可证
 
-该项目使用 MIT 许可证，详情见 [LICENSE](LICENSE) 文件。
+MIT License. 详见 [LICENSE](LICENSE)。

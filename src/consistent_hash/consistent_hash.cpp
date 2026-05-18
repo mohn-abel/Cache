@@ -40,10 +40,11 @@ static constexpr uint32_t kCrc32IEEETable[256] = {
     0x24b4a3a6, 0xbad03605, 0xcdd70693, 0x54de5729, 0x23d967bf, 0xb3667a2e, 0xc4614ab8, 0x5d681b02, 0x2a6f2b94,
     0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d,
 };
-
+// 哈希算法：将任何字符串变成一个纯数字，即哈希环上的刻度坐标
 uint32_t Crc32IEEE(const std::string& data) {
     uint32_t crc = 0xFFFFFFFF;
     for (char c : data) {
+        // 利用查表法代替复杂的位运算
         crc = kCrc32IEEETable[(crc ^ static_cast<uint8_t>(c)) & 0xFF] ^ (crc >> 8);
     }
     return crc ^ 0xFFFFFFFF;
@@ -59,13 +60,13 @@ ConsistentHashMap::~ConsistentHashMap() {
         balancer_thread_.join();  // 等待负载均衡器线程完成
     }
 }
-
+// 添加真实节点，供外部调用
 bool ConsistentHashMap::Add(const std::vector<std::string>& nodes) {
     if (nodes.empty()) {
         return false;
     }
 
-    std::unique_lock lock{mtx_};  // 获取写锁
+    std::unique_lock lock{mtx_};  // 获取写锁，独占，哪个线程先拿到这把锁就只能由这把锁的持有者来修改
 
     for (const auto& node : nodes) {
         if (node.empty()) {
@@ -79,13 +80,13 @@ bool ConsistentHashMap::Add(const std::vector<std::string>& nodes) {
     std::sort(keys_.begin(), keys_.end());
     return true;
 }
-
+// 节点突发意外需要进行移除
 bool ConsistentHashMap::Remove(const std::string& node) {
     if (node.empty()) {
         return false;
     }
 
-    std::unique_lock lock{mtx_};  // 获取写锁
+    std::unique_lock lock{mtx_};  // 获取写锁，独占，哪个线程先拿到这把锁就只能由这把锁的持有者来修改
 
     auto it_replicas = node_replicas_.find(node);
     if (it_replicas == node_replicas_.end()) {
@@ -96,8 +97,8 @@ bool ConsistentHashMap::Remove(const std::string& node) {
 
     // 移除节点的所有虚拟节点
     for (int i = 0; i < replicas; ++i) {
-        std::string hash_key = fmt::format("{}-{}", node, std::to_string(i));
-        uint32_t hash = config_.hash_func(hash_key);
+        std::string hash_key = fmt::format("{}-{}", node, std::to_string(i)); // 统一节点名称格式
+        uint32_t hash = config_.hash_func(hash_key); // 获取名称哈希值
         hash_map_.erase(hash);  // 从哈希映射中移除
         // 从哈希环中移除哈希值
         auto it = std::remove(keys_.begin(), keys_.end(), hash);
@@ -108,20 +109,22 @@ bool ConsistentHashMap::Remove(const std::string& node) {
     node_counts_.erase(node);  // 从负载统计中移除
     return true;
 }
-
+// 获取节点：通过key找到其所在节点，写入
 auto ConsistentHashMap::Get(const std::string& key) -> std::string {
     if (key.empty()) {
         return "";
     }
-
-    std::shared_lock lock{mtx_};  // 获取读锁
+    // 既然所有线程都可以读，那么为什么还要设计一把锁在这呢？
+    // 读锁是为了标识，有线程正在读取信息，如果其他线程要修改数据也要等读数据的线程把锁上交之后才能修改
+    // 只要系统里有读写操作，哪怕只有一次写的操作，都需要读写两把锁来保证数据读写过程的安全
+    std::shared_lock lock{mtx_};  // 获取读锁，所有线程都可以读
 
     if (keys_.empty()) {
         return "";
     }
 
     uint32_t hash = config_.hash_func(key);
-    // 二分查找：找到第一个大于等于 hash 的位置
+    // 二分查找：找到第一个大于等于 hash 的虚拟节点
     auto it = std::lower_bound(keys_.begin(), keys_.end(), hash);
 
     // 处理边界情况：如果到了末尾，则回到开头
@@ -136,55 +139,57 @@ auto ConsistentHashMap::Get(const std::string& key) -> std::string {
 
     return node;
 }
-
+// 获取节点负载状况
 auto ConsistentHashMap::GetStats() -> std::unordered_map<std::string, double> {
     std::shared_lock lock{mtx_};  // 获取读锁
-
+    // 存储真实物理节点与该节点访问数占总访问数的占比
     std::unordered_map<std::string, double> stats;
-    long long curr_total = total_requests_.load();
+    long long curr_total = total_requests_.load(); // 获取当前的总请求数
     if (curr_total == 0) {
         return stats;
     }
-
+    // 获取每个节点的访问数，并得出节点占总访问数的占比，方便后续自适应调整节点的虚拟节点数量
     for (auto const& [node, count] : node_counts_) {
         stats[node] = static_cast<double>(count.load()) / static_cast<double>(curr_total);
     }
     return stats;
 }
-
+// 进行负载平衡
 void ConsistentHashMap::StartBalancer() {
     is_balancer_stop_ = false;
     balancer_thread_ = std::thread{[this] {
+        // 进行一个死循环，当系统没下发停止指令就一直循环
         while (!is_balancer_stop_) {
             std::this_thread::sleep_for(std::chrono::seconds(1));  // 每秒检查一次
             if (!is_balancer_stop_) {  // 再次检查，防止在 sleep 期间被要求停止
-                CheckAndRebalance();
+                CheckAndRebalance(); // 进行负载平衡
             }
         }
     }};
 }
-
+// 添加单个节点，内部构建
 void ConsistentHashMap::AddNode(const std::string& node, int replicas) {
+    // 创建虚拟节点
     for (int i = 0; i < replicas; ++i) {
-        std::string hash_key = fmt::format("{}-{}", node, std::to_string(i));
+        std::string hash_key = fmt::format("{}-{}", node, std::to_string(i)); // 以“NodeA-1”格式命名
         spdlog::debug("Adding virtual node: {} with hash key: {}", node, hash_key);
-        uint32_t hash = config_.hash_func(hash_key);
-        keys_.push_back(hash);
-        hash_map_[hash] = node;
+        uint32_t hash = config_.hash_func(hash_key); // 不修改默认配置的情况下哈希函数就是Crc32IEEE
+        keys_.push_back(hash); // 将哈希值填入哈希环中
+        hash_map_[hash] = node; // 将哈希值映射至对应的节点上
     }
-    node_replicas_[node] = replicas;
+    node_replicas_[node] = replicas; // 真实物理节点与虚拟节点数量的映射
     // 如果节点是新添加的，初始化其计数器
     if (node_counts_.find(node) == node_counts_.end()) {
         node_counts_[node] = 0;
     }
 }
-
+// 判断系统是否出现负载倾斜
 void ConsistentHashMap::CheckAndRebalance() {
     if (total_requests_.load() < 1000) {
         return;  // 样本太少，不进行调整
     }
 
-    std::shared_lock lock{mtx_};
+    std::shared_lock lock{mtx_}; // 获取读锁
 
     if (node_replicas_.empty()) {
         return;
@@ -214,14 +219,14 @@ void ConsistentHashMap::CheckAndRebalance() {
         RebalanceNodes();
     }
 }
-
+// 调整虚拟节点
 void ConsistentHashMap::RebalanceNodes() {
     std::unique_lock lock{mtx_};  // 获取写锁
 
     if (node_replicas_.empty()) {
         return;
     }
-
+    
     long long current_total_requests = total_requests_.load();
     double avg_load = static_cast<double>(current_total_requests) / node_replicas_.size();
 

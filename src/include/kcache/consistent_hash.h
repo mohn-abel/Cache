@@ -14,18 +14,19 @@
 
 namespace kcache {
 
-// CRC32 IEEE 哈希函数，兼容 Go 的 crc32.ChecksumIEEE
+// CRC32 IEEE 哈希函数，兼容 Go 的 crc32.ChecksumIEEE,能够将任意字符串变成一个32位的无符号整数
 uint32_t Crc32IEEE(const std::string& data);
 
-// 一致性哈希配置
+// 一致性哈希配置,传统的取模算法在增加或删除服务器节点时会导致缓存雪崩,所以构建一个首尾相连的哈希环
+// 配置单:决定哈希环长什么样
 struct HashConfig {
-    // 每个真实节点对应的虚拟节点数
+    // 每个真实节点对应的虚拟节点数,防止机器少时数据分配不均,将物理机虚拟成多个虚拟节点
     int replicas;
     // 最小虚拟节点数
     int min_replicas;
     // 最大虚拟节点数
     int max_replicas;
-    // 哈希函数
+    // 哈希函数，将函数作为变量输入
     std::function<uint32_t(const std::string&)> hash_func;
     // 负载均衡阈值，超过此值触发虚拟节点调整
     double load_balance_threshold;
@@ -40,7 +41,9 @@ const HashConfig kDefaultConfig = {
 // Map 一致性哈希实现
 class ConsistentHashMap {
 public:
-    // New 创建一致性哈希实例
+    // New 创建一致性哈希实例,explicit显式声明,不允许自动类型转换,必须显式调用构造函数创建对象
+    // 如果不加explicit,此句ConsistentHashMap my_map = my_cfg;就会临时生成一个map对象,并对其赋值,造成巨大的性能损耗
+    // 而使用explicit显式声明后,只能通过ConsistentHashMap my_map(my_cfg)
     explicit ConsistentHashMap(HashConfig cfg = kDefaultConfig);
 
     // 析构函数，确保负载均衡器线程正确停止
@@ -74,21 +77,23 @@ private:
     void StartBalancer();
 
 private:
+    // 多线程读写锁：C++14新特性，支持多个人同时读，写的时候必须独占
+    // 加上mutable即在const修饰的get函数中也可以改变锁的状态
     mutable std::shared_mutex mtx_;  // 读写互斥量，类似于 Go 的 sync.RWMutex
     // 配置信息
     HashConfig config_;
 
-    // 哈希环
+    // 哈希环，存放所有虚拟节点哈希值的vector
     std::vector<uint32_t> keys_;
-    // 哈希环到节点的映射
+    // 哈希环中存储的哈希值到真实物理节点的映射
     std::unordered_map<uint32_t, std::string> hash_map_;
-    // 节点到虚拟节点数量的映射
+    // 真实物理节点到虚拟节点数量的映射，方便后续自适应调整
     std::unordered_map<std::string, int> node_replicas_;
     // 节点负载统计
-    // 使用 std::atomic<long long> 保证对 nodeCounts 中每个节点计数的原子操作
+    // 使用 std::atomic<long long> 保证对 nodeCounts 中每个节点计数的原子操作(读写必须完整进行),一个自带线程安全光环、且性能极高的 64 位整数。
     std::unordered_map<std::string, std::atomic<long long>> node_counts_;
     // 总请求数
-    std::atomic<long long> total_requests_;
+    std::atomic<long long> total_requests_; // 同理读写必须完整进行，避免数据竞争
 
     std::thread balancer_thread_;         // 负载均衡器线程
     std::atomic<bool> is_balancer_stop_;  // 控制负载均衡器线程停止的标志

@@ -1,29 +1,34 @@
+// 规范通信格式
 syntax = "proto3";
 
 package kcache.pb;
 
+// 统一的请求体，无论是get还是set都按照以下格式
+// 需包含缓存所在的组，缓存的键名，缓存的值
 message Request {
-    string group = 1;
-    string key = 2;
+    string group = 1; // 标签，用1代替group，节省字符空间，
+    string key = 2; 
     bytes value = 3;
 }
-
+// 返回查询到的值
 message GetResponse {
-    bytes value = 1;
+    bytes value = 1; 
 }
-
+// 返回删除的操作结果
 message DeleteResponse {
-    bool value = 1;
+    bool value = 1; // 成功为true，失败为false
 }
-
+// 返回写入的操作结果
 message SetResponse {
     bool value = 1;
 }
-
+// 返回使数据无效化的操作结果
 message InvalidateResponse {
     bool value = 1;
 }
-
+// 满足gRPC一进一出规则，格式rpc 方法名(输入) returns (输出)
+// 所以为了rpc Get(string group, string key)将group和key封装为一个结构体Request
+// 必须有返回值
 service KCache {
     rpc Get(Request) returns (GetResponse);
     rpc Set(Request) returns (SetResponse);
