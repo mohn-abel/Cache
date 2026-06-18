@@ -35,6 +35,14 @@ conan_export/
 bench*.json
 warmup*.json
 
+# Local perf / benchmark outputs
+perf*.data
+perf.data*
+out*.perf
+out*.folded
+flamegraph*.svg
+*执行结果*.txt
+
 # Images (not docs)
 *.png
 *.jpg

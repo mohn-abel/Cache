@@ -1,1 +1,2 @@
 add_subdirectory(http_gateway)
+add_subdirectory(bench_cache)

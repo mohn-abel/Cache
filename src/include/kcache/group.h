@@ -48,7 +48,8 @@ public:
                 CircuitBreakerConfig cb_cfg = {},
                 int64_t getter_timeout_ms = 3000,
                 int64_t fail_cooldown_ms = 1000,
-                int64_t cache_ttl_ms = 0)
+                int64_t cache_ttl_ms = 0,
+                int64_t stale_ttl_ms = 0)
         : cache_(std::make_unique<LRUCache>(bytes)), 
           stale_cache_(std::make_unique<LRUCache>(bytes)),
           name_(name), getter_(getter),
@@ -56,7 +57,8 @@ public:
           breaker_(std::make_unique<CircuitBreaker>(name, cb_cfg)),
           getter_timeout_ms_(getter_timeout_ms),
           fail_cooldown_ms_(fail_cooldown_ms),
-          cache_ttl_ms_(cache_ttl_ms)
+          cache_ttl_ms_(cache_ttl_ms),
+          stale_ttl_ms_(stale_ttl_ms)
         {}
     // KCacheGroup是一个非常庞大的资源管理器，不是一个简单的数值
     // 禁用拷贝，内部unique_ptr以及singleflight有锁都是不支持拷贝赋值的
@@ -75,6 +77,7 @@ public:
         getter_timeout_ms_ = other.getter_timeout_ms_;
         fail_cooldown_ms_ = other.fail_cooldown_ms_;
         cache_ttl_ms_ = other.cache_ttl_ms_;
+        stale_ttl_ms_ = other.stale_ttl_ms_;
         is_close_ = other.is_close_.load();
         // 转移原子量统计数据
         status_.loads.store(other.status_.loads.load());
@@ -101,6 +104,7 @@ public:
         getter_timeout_ms_ = other.getter_timeout_ms_;
         fail_cooldown_ms_ = other.fail_cooldown_ms_;
         cache_ttl_ms_ = other.cache_ttl_ms_;
+        stale_ttl_ms_ = other.stale_ttl_ms_;
         is_close_ = other.is_close_.load();
         // 转移原子量统计数据
         status_.loads.store(other.status_.loads.load());
@@ -156,6 +160,7 @@ private:
     int64_t getter_timeout_ms_{3000}; // getter 超时时间
     int64_t fail_cooldown_ms_{1000};  // SingleFlight 失败冷却期（ms）
     int64_t cache_ttl_ms_{0};         // 缓存条目 TTL（ms），0 = 永不过期
+    int64_t stale_ttl_ms_{0};         // stale 缓存 TTL（ms），0 = 永不过期
 };
 
 
@@ -165,7 +170,8 @@ auto MakeCacheGroup(const std::string& name, int64_t bytes, DataGetter getter,
                     FallbackGetter fallback = nullptr,
                     CircuitBreakerConfig cb_cfg = {},
                     int64_t getter_timeout_ms = 3000,
-                    int64_t cache_ttl_ms = 0) -> KCacheGroup&;
+                    int64_t cache_ttl_ms = 0,
+                    int64_t stale_ttl_ms = 0) -> KCacheGroup&;
 auto GetCacheGroup(const std::string& name) -> KCacheGroup*; // 获取指定缓存组的实例指针
 std::vector<std::string> GetAllGroupNames(); // 获取所有缓存组名称
 

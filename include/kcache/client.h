@@ -54,6 +54,8 @@ private:
     auto GetCacheNode(const std::string& key) -> std::string; // 路由寻址核心：输入业务 key，返回到底该去哪个 IP 地址拿数据
     // 新增：辅助函数，获取gRPC连接
     auto GetOrCreateChannel(const std::string& addr) -> std::shared_ptr<grpc::Channel>;
+    // 清理已下线节点的 gRPC Channel 缓存
+    void RemoveChannel(const std::string& addr);
     // 新增：per-node 熔断器池
     auto GetOrCreateBreaker(const std::string& addr) -> CircuitBreaker*;
 private:

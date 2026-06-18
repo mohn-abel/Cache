@@ -85,6 +85,31 @@ TEST_F(CacheGroupTest, DeleteRemovesCache) {
     EXPECT_EQ(call_count_["key2"], 1);
 }
 
+// Delete 应同时删除 stale cache，避免后端故障时旧值通过 fallback 复活
+TEST_F(CacheGroupTest, DeleteAlsoRemovesStaleCache) {
+    CircuitBreakerConfig cfg;
+    cfg.failure_threshold = 1;
+
+    bool getter_throws = false;
+    DataGetter getter = [&](const std::string& key) -> ByteViewOptional {
+        if (getter_throws) {
+            throw std::runtime_error("mock failure");
+        }
+        auto it = db_.find(key);
+        if (it != db_.end()) return ByteView{it->second};
+        return std::nullopt;
+    };
+
+    KCacheGroup group("group_delete_stale", 1024, getter, nullptr, cfg, 3000, 0);
+
+    ASSERT_TRUE(group.Get("key1").has_value());
+    EXPECT_TRUE(group.Delete("key1"));
+
+    getter_throws = true;
+    auto r = group.Get("key1");
+    EXPECT_FALSE(r.has_value());
+}
+
 // 调用 InvalidateFromPeer 仅删除本地缓存，下一次 Get 才会回源
 TEST_F(CacheGroupTest, InvalidateFromPeerOnlyDeletesLocal) {
     KCacheGroup group("group_invalidate", 1024, getter_);
@@ -99,6 +124,31 @@ TEST_F(CacheGroupTest, InvalidateFromPeerOnlyDeletesLocal) {
     EXPECT_EQ(r->ToString(), "value3");
     // 失效后应回源一次
     EXPECT_EQ(call_count_["key3"], 1);
+}
+
+// Invalidate 应同时删除 stale cache，避免失效后降级返回旧副本
+TEST_F(CacheGroupTest, InvalidateAlsoRemovesStaleCache) {
+    CircuitBreakerConfig cfg;
+    cfg.failure_threshold = 1;
+
+    bool getter_throws = false;
+    DataGetter getter = [&](const std::string& key) -> ByteViewOptional {
+        if (getter_throws) {
+            throw std::runtime_error("mock failure");
+        }
+        auto it = db_.find(key);
+        if (it != db_.end()) return ByteView{it->second};
+        return std::nullopt;
+    };
+
+    KCacheGroup group("group_invalidate_stale", 1024, getter, nullptr, cfg, 3000, 0);
+
+    ASSERT_TRUE(group.Get("key3").has_value());
+    EXPECT_TRUE(group.InvalidateFromPeer("key3"));
+
+    getter_throws = true;
+    auto r = group.Get("key3");
+    EXPECT_FALSE(r.has_value());
 }
 
 // 空 key 在 Get/Set/Delete/InvalidateFromPeer 均返回 false
@@ -337,11 +387,14 @@ TEST_F(CacheGroupTest, MetricAccessorsWork) {
     EXPECT_EQ(group.CacheCount(), 1);
     EXPECT_GT(group.CacheBytes(), 0);
 
-    // GetStatus 初始计数器检查
+    auto cached = group.Get("key1");
+    ASSERT_TRUE(cached.has_value());
+
+    // GetStatus 计数器检查：首次回源命中 loader，第二次命中本地缓存
     const auto& s = group.GetStatus();
-    EXPECT_EQ(s.local_hits.load(), 1);      // key1 第二次访问才算命中
-    // key1 第一次 Get 时本地未命中
-    EXPECT_GE(s.local_misses.load(), 1);
+    EXPECT_EQ(s.loader_hits.load(), 1);
+    EXPECT_EQ(s.local_hits.load(), 1);
+    EXPECT_EQ(s.local_misses.load(), 1);
 }
 
 // GetAllGroupNames 测试

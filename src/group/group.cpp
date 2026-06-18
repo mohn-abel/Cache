@@ -34,7 +34,8 @@ auto MakeCacheGroup(const std::string& name, int64_t bytes, DataGetter getter,
                     FallbackGetter fallback,
                     CircuitBreakerConfig cb_cfg,
                     int64_t getter_timeout_ms,
-                    int64_t cache_ttl_ms) -> KCacheGroup& {
+                    int64_t cache_ttl_ms,
+                    int64_t stale_ttl_ms) -> KCacheGroup& {
     // 安全检查:缺少数据库查询函数直接退出
     if (getter == nullptr) {
         spdlog::critical("no getter function!");
@@ -42,7 +43,9 @@ auto MakeCacheGroup(const std::string& name, int64_t bytes, DataGetter getter,
     }
     std::unique_lock lock{mtx};  // 写锁
     // 原地构建一个group临时对象,并使用move将所有权移交给哈希表
-    cache_groups[name] = std::move(KCacheGroup{name, bytes, getter, fallback, cb_cfg, getter_timeout_ms, 1000, cache_ttl_ms});
+    cache_groups[name] = std::move(KCacheGroup{name, bytes, getter, fallback, cb_cfg,
+                                               getter_timeout_ms, 1000, cache_ttl_ms,
+                                               stale_ttl_ms});
     return cache_groups[name];
 }
 // 获取缓存组
@@ -98,8 +101,13 @@ bool KCacheGroup::Set(const std::string& key, ByteView b) {
         spdlog::warn("The key [{}] is empty, you can't set it into cache group", key);
         return false;
     }
-    // 存缓存
+    // 主动写入应同步刷新 stale，避免后续降级路径返回旧值。
     cache_->Set(key, b);
+    if (stale_ttl_ms_ > 0) {
+        stale_cache_->Set(key, b, stale_ttl_ms_);
+    } else {
+        stale_cache_->Set(key, b);
+    }
     spdlog::debug("key:{} is set value:{}", key, b.ToString());
     return true;
 }
@@ -114,6 +122,7 @@ bool KCacheGroup::Delete(const std::string& key) {
         return false;
     }
     cache_->Delete(key);
+    stale_cache_->Delete(key);
     spdlog::debug("key:{} is deleted", key);
     return true;
 }
@@ -132,8 +141,9 @@ bool KCacheGroup::InvalidateFromPeer(const std::string& key) {
         return false;
     }
 
-    // 来自其他节点的失效请求，删除本地缓存
+    // 来自其他节点的失效请求，删除 fresh 和 stale，避免降级路径返回旧副本。
     cache_->Delete(key);
+    stale_cache_->Delete(key);
     spdlog::debug("Invalidated key [{}] from local cache (from peer)", key);
     return true;
 }
@@ -184,24 +194,40 @@ auto KCacheGroup::Load(const std::string& key) -> ByteViewOptional {
     auto cooldown = fail_cooldown_ms_ > 0
                             ? std::chrono::milliseconds(fail_cooldown_ms_)
                             : std::chrono::milliseconds::zero();
+    // 回源计时：每进入一次真实回源都记一次 loads，并累计耗时（纳秒），
+    // 供 kcache_loads / kcache_avg_load_duration_ms 指标使用。
+    auto load_start = std::chrono::steady_clock::now();
     auto ret = loader_.Do(key, [&] { return LoadData(key); }, wait_timeout, cooldown);
+    auto load_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - load_start)
+                       .count();
+    ++status_.loads;
+    status_.load_duration += load_ns;
     // 1.真故障处理
     if (ret.is_error) {
         breaker_->RecordFailure();
         spdlog::error("Failed to load data for key: {}", key);
         // getter 真故障（超时/异常/数据库连接失败），走降级
         return Fallback(key);
-    } 
+    }
     // 2.正常处理
     breaker_->RecordSuccess();
 
     if(!ret.data){
-        ++status_.local_misses; // 本地未命中缓存次数+1
+        // key 不存在：回源未命中，走降级。
+        // 注意：local_misses 已在 Get() 命中失败时计过一次，这里不再重复自增，
+        // 否则会把同一次未命中重复计数、污染 hit_ratio。
         spdlog::warn("Data for key [{}] not found in local getter", key);
         return Fallback(key); // key 不存在也应走降级，但不触发熔断
     }
-    // 成功获取数据，存入本地缓存后返回
-    stale_cache_->Set(key, ret.data.value());
+    // 回源命中：统一在此记入 loader_hits（区别于 local_hits 本地缓存命中）
+    ++status_.loader_hits;
+    // 成功获取数据，存入 fresh 和 stale 后返回。
+    if (stale_ttl_ms_ > 0) {
+        stale_cache_->Set(key, ret.data.value(), stale_ttl_ms_);
+    } else {
+        stale_cache_->Set(key, ret.data.value());
+    }
     if(cache_ttl_ms_ > 0){
         cache_->Set(key, ret.data.value(), cache_ttl_ms_);
     } else {
@@ -221,7 +247,7 @@ auto KCacheGroup::LoadData(const std::string& key) -> SingleFlightResult {
                 // getter 正常返回但未找到数据：NOT_FOUND，不是错误
                 return {std::nullopt, false}; // 未找到，非异常
             }
-            ++status_.local_hits;
+            // 回源命中由上层 Load() 统一记入 loader_hits，这里不再误记为 local_hits
             return {val, false};
         } catch (...) {
             // getter 抛异常：真正的数据库故障
@@ -280,7 +306,7 @@ auto KCacheGroup::LoadData(const std::string& key) -> SingleFlightResult {
                 // getter 正常返回 nullopt：数据不存在，不是错误
                 return {std::nullopt, false};
             }
-            ++status_.local_hits;
+            // 回源命中由上层 Load() 统一记入 loader_hits，这里不再误记为 local_hits
             return result;
         } catch (...) {
             // getter 在 detached 线程中抛异常：真正的数据库故障

@@ -242,6 +242,7 @@ void KCacheClient::HandleWatchEvents(const etcd::Response& resp) {
                     cache_nodes_.erase(addr); // 移除该IP
                     consistent_hash_.Remove(addr); // 一致性哈希路由上删除该节点，重新分配哈希环
                     breaker_pool_.erase(addr); // 清理该节点的熔断器
+                    RemoveChannel(addr); // 清理该节点的 gRPC Channel 缓存
                     spdlog::debug("Service removed: {} (key: {})", addr, key);
                 }
                 break;
@@ -331,6 +332,11 @@ auto KCacheClient::GetOrCreateChannel(const std::string& addr) -> std::shared_pt
     auto channel = grpc::CreateCustomChannel(addr, grpc::InsecureChannelCredentials(), args);
     channel_pool_[addr] = channel;
     return channel;
+}
+
+void KCacheClient::RemoveChannel(const std::string& addr) {
+    std::lock_guard<std::mutex> lock(channel_mutex_);
+    channel_pool_.erase(addr);
 }
 
 // 新增辅助函数：新增或获取熔断器

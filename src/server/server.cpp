@@ -218,13 +218,8 @@ auto KCacheServer::GenerateMetrics() -> std::string {
         out += fmt::format("# TYPE kcache_hit_ratio gauge\n");
         out += fmt::format("{} {:.6f}\n", q("kcache_hit_ratio"), hit_ratio);
 
-        out += fmt::format("# HELP kcache_peer_hits Total peer cache hits\n");
-        out += fmt::format("# TYPE kcache_peer_hits counter\n");
-        out += fmt::format("{} {}\n", q("kcache_peer_hits"), s.peer_hits.load());
-
-        out += fmt::format("# HELP kcache_peer_misses Total peer cache misses\n");
-        out += fmt::format("# TYPE kcache_peer_misses counter\n");
-        out += fmt::format("{} {}\n", q("kcache_peer_misses"), s.peer_misses.load());
+        // 注：本项目为客户端分片架构，服务端节点不做 peer 回源，
+        // 因此不再暴露 kcache_peer_hits / kcache_peer_misses（其值恒为 0，徒增误导）。
 
         out += fmt::format("# HELP kcache_loader_hits Total loader hits\n");
         out += fmt::format("# TYPE kcache_loader_hits counter\n");

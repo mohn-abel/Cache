@@ -2,17 +2,17 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kerolt/kcache)
 
-KCache 是一个类 Memcached 的分布式缓存系统，采用 C/S 架构，基于一致性哈希实现数据分片，使用 LRU 淘汰算法。节点间通过 gRPC 通信，基于 etcd 实现服务注册与发现。
+KCache 是一个类 Memcached 的分布式缓存系统，采用 C/S 架构，基于一致性哈希实现客户端侧 key 路由，使用 LRU 淘汰算法。客户端与缓存节点通过 gRPC 通信，基于 etcd 实现服务注册与发现。
 
 ## 特性
 
-- **分布式路由** — 一致性哈希 + 虚拟节点 + 自适应负载均衡，节点增减时最小化数据迁移
+- **分布式路由** — 一致性哈希 + 虚拟节点，节点增减时降低路由映射变更范围，并支持基于访问计数的后台重平衡实验
 - **防缓存击穿** — SingleFlight 合并并发请求，同一 key 只回源一次
 - **熔断降级** — 三态熔断器 (Closed→Open→HalfOpen)，回源失败时自动走 Fallback 或返回过期缓存
 - **TTL 过期** — 支持写入时指定过期时间，Get 时惰性删除
-- **可观测性** — Prometheus 指标端点，暴露命中率、熔断状态、加载耗时等 15 项指标
+- **可观测性** — Prometheus 指标端点，暴露命中率、回源耗时、熔断状态等指标
 - **资源保护** — gRPC 超时控制、连接池复用、KeepAlive 探活、并发流限流
-- **强一致性** — Set 时广播 Invalidate 到其他节点，Delete 时全节点广播
+- **最终一致性** — Set 时广播 Invalidate 到其他节点，Delete 时全节点广播，并以 TTL 兜底（广播失败不回滚）
 
 ## 运行环境
 
@@ -67,22 +67,23 @@ KCache 是一个类 Memcached 的分布式缓存系统，采用 C/S 架构，基
 
 ```
 用户请求
-  → 本地 LRU 缓存（命中直接返回）
+  → 客户端一致性哈希定位目标节点
+  → gRPC Get 请求目标节点
+  → 目标节点本地 LRU 缓存（命中直接返回）
   → SingleFlight 防击穿（同一 key 只允许一个线程回源）
-  → 熔断检查（触发熔断则走 Fallback 降级）
-  → gRPC 请求远程节点
-  → 回源数据库（getter 回调）
-  → 写入本地缓存并返回
+  → 服务端熔断检查（触发熔断则走 Fallback / stale cache）
+  → 本地 getter 回源
+  → 写入目标节点本地缓存并返回
 ```
 
 **SET 流程：**
 
 ```
 用户写入
-  → 一致性哈希定位主节点
-  → gRPC Set 写入主节点
-  → 并发 Invalidate 广播到其余所有节点（使过期缓存失效）
-  → 全部成功返回
+  → 客户端一致性哈希定位目标节点
+  → gRPC Set 写入目标节点
+  → 向其他可用节点发送 Invalidate 失效通知
+  → 根据目标写入和失效通知结果返回
 ```
 
 **DELETE 流程：**
@@ -91,7 +92,7 @@ KCache 是一个类 Memcached 的分布式缓存系统，采用 C/S 架构，基
 用户删除
   → 向所有存活节点广播 Delete
   → 各节点删除本地缓存
-  → 全部完成返回
+  → 根据各节点删除结果返回
 ```
 
 ## 项目结构
@@ -103,7 +104,7 @@ KCache 是一个类 Memcached 的分布式缓存系统，采用 C/S 架构，基
 ├── src/
 │   ├── cache/lru.cpp            # LRU 缓存（TTL、淘汰回调）
 │   ├── client/client_sdk.cpp    # 客户端 SDK（服务发现、路由、熔断器池）
-│   ├── consistent_hash/         # 一致性哈希（虚拟节点、自适应负载均衡）
+│   ├── consistent_hash/         # 一致性哈希（虚拟节点、后台重平衡实验）
 │   ├── group/group.cpp          # 缓存组（Get/Set/Delete、Fallback）
 │   ├── server/server.cpp        # gRPC 服务端（Prometheus 指标、安全加固）
 │   ├── registry/registry.cpp    # etcd 服务注册（lease 心跳）
@@ -277,8 +278,6 @@ curl -X DELETE http://localhost:9000/api/cache/default/Kerolt
 |---|---|---|
 | `kcache_local_hits` | Counter | 本地缓存命中 |
 | `kcache_local_misses` | Counter | 本地缓存未命中 |
-| `kcache_peer_hits` | Counter | 远端节点命中 |
-| `kcache_peer_misses` | Counter | 远端节点未命中 |
 | `kcache_loader_hits` | Counter | 回源成功 |
 | `kcache_loader_errors` | Counter | 回源失败 |
 | `kcache_circuit_breaks` | Counter | 熔断触发次数 |
@@ -286,7 +285,7 @@ curl -X DELETE http://localhost:9000/api/cache/default/Kerolt
 | `kcache_getter_timeouts` | Counter | getter 超时次数 |
 | `kcache_hit_ratio` | Gauge | 命中率 |
 | `kcache_avg_load_duration_ms` | Gauge | 平均加载耗时 |
-| `kcache_circuit_breaker_state` | Gauge | 熔断器状态 (0=Closed, 1=Open, 2=HalfOpen) |
+| `kcache_circuit_breaker_state` | Gauge | 熔断器状态 (1=Closed, 2=Open, 3=HalfOpen) |
 | `kcache_cache_bytes` | Gauge | 当前缓存占用 |
 | `kcache_cache_max_bytes` | Gauge | 缓存容量上限 |
 | `kcache_cache_count` | Gauge | 缓存条目数 |
@@ -341,7 +340,7 @@ cfg.failure_reset_timeout_ms = 10000; // 失效计数过期窗口
 
 - CRC32 IEEE 哈希函数（兼容 Go `crc32.ChecksumIEEE`）
 - 虚拟节点机制，可配置 replica 数范围
-- 后台线程监控负载，超过 25% 不均衡时自适应调整虚拟节点
+- 后台线程基于访问计数监控负载，超过阈值时可调整虚拟节点（实验性能力，会改变路由映射）
 - 线程安全（`shared_mutex` + 原子计数器）
 
 ### Fallback 降级
@@ -353,39 +352,111 @@ cfg.failure_reset_timeout_ms = 10000; // 失效计数过期窗口
 
 ## 压测
 
-单节点 gRPC Get 压测（使用 [ghz](https://ghz.sh/)）：
+### 1. gRPC 全栈压测
+
+单节点 gRPC Get 命中路径压测（使用 [ghz](https://ghz.sh/)），128 并发、8 连接、持续 60 秒。
+
+注意：`node_server` 启动后会先启动 gRPC 服务，再创建缓存组。压测前建议等待至少 6 秒，并先用 `--total=1` 验证 `default/Tom` 可访问，避免测到 `Group not found` 或首次回源路径。
 
 ```sh
+# 启动服务
+./bin/node_server --port=8001 --node=A --log_level=warn &
+
+# 预热 / 验证
 ghz --insecure \
   --proto ./src/proto/kcache.proto \
   --call kcache.pb.KCache/Get \
   --data '{"group":"default","key":"Tom"}' \
-  --connections=4 --concurrency=128 \
+  --total=1 \
+  localhost:8001
+
+# 压测
+ghz --insecure \
+  --proto ./src/proto/kcache.proto \
+  --call kcache.pb.KCache/Get \
+  --data '{"group":"default","key":"Tom"}' \
+  --connections=8 --concurrency=128 \
   --duration=60s --skipFirst=1000 \
   localhost:8001
 ```
 
-**结果摘要：**
+**实测结果（Ubuntu 20.04 VM，8C8G，Release，无 perf 采样）：**
 
 ```
-Count:        1,062,812
-Total:        60.01 s
-Requests/sec: 17,710
-Average:      5.29 ms
-p50:          4.74 ms
-p99:          15.69 ms
+Requests/sec: 19,176.90      (≈ 1.92w)
+Average:      4.60 ms
+p50:          4.19 ms
+p95:          9.75 ms
+p99:          14.32 ms
+Count:        1,150,758
+OK:           1,150,648      (错误 110 ≈ 0.01%，均为压测结束拆连接的瞬时 Unavailable/Canceled，非负载失败)
 ```
 
-并发梯度测试：
+> 说明：另有一组在 `perf record` 采样下同步进行的压测，QPS 约 1.5w（见“瓶颈归因”一节）——比上面的干净结果低，正是采样开销（观测者效应）本身，故对外口径以干净结果为准。
+
+### 2. KCache 裸调用压测（绕过 gRPC）
+
+使用 `bench_cache` 直接调用 `KCacheGroup::Get()`，绕过 gRPC / protobuf / HTTP/2 全栈：
 
 ```sh
-for c in 16 32 64 128 256 512; do
+# 编译
+cmake --build build/Release -j$(nproc) --target bench_cache
+
+# 单线程
+./bin/bench_cache --threads=1 --duration_sec=10
+
+# 4 线程（用于 perf 采样）
+./bin/bench_cache --threads=4 --duration_sec=10
+
+# 128 线程（与 ghz 同等并发）
+./bin/bench_cache --threads=128 --duration_sec=10
+```
+
+**结果：**
+
+| 场景 | QPS | 说明 |
+|------|-----|------|
+| gRPC 全栈 (8 连接/128 并发) | 19,176 | `ghz` 端到端 Get（干净运行） |
+| KCache 裸调 (1 线程) | 5,038,571 | 单线程核心命中路径 |
+| KCache 裸调 (4 线程) | 2,234,932 | 4 线程核心命中路径 |
+| KCache 裸调 (128 线程) | 1,438,578 | 高并发核心命中路径 |
+
+`bench_cache` 会预填充 100 个 key，并在线程内轮转访问这些 key。它用于观察核心缓存命中路径上限，不是 gRPC 全栈压测的一比一替代。
+
+### 3. 瓶颈归因（perf + 火焰图分析）
+
+```
+穿过 gRPC 全栈：                绕过 gRPC 裸调 KCache：
+
+perf 热点                        perf 热点
+  futex_wake 51.36%                KCacheGroup::Get 99.02%
+  sendmsg 8.89%                    pthread_mutex_unlock 84.74%
+  recvmsg 3.51%                    futex_wake 84.61%
+  KCacheGroup::Get 0.16%           futex_wait 11.54%
+```
+
+> **分层结论**：
+> 1. **gRPC 全栈路径**：服务端 CPU 主要消耗在 gRPC 同步服务线程调度、`futex_wake` 和 TCP send/recv 路径，KCache 业务代码占比很低。
+> 2. **KCache 裸调路径**：绕过 gRPC 后，`KCacheGroup::Get()` 成为主路径，热点集中在 LRU 独占锁的 `pthread_mutex_unlock -> futex_wake` 和 `futex_wait`。
+>
+> 注意：gRPC 全栈和 `bench_cache` 负载模型不同，QPS 倍率只能作为分层参考，不能直接解释为某个组件“吃掉了固定倍数”的性能。
+>
+> 观测者效应：上面这组 perf 热点是在 `perf record` 采样下采集的，同一压测此时 QPS 约 1.5w；关闭 perf 后干净运行可达 1.92w。采样本身约占一档性能，因此热点占比可信、但绝对 QPS 以干净运行为准。
+>
+> 详见 [perf 性能分析报告](docs/perf-analysis-report.md)。
+
+### 4. 并发梯度测试
+
+并发梯度暂未纳入本轮结论。若继续测试，建议从较小并发开始，避免虚拟机瞬时压力过大：
+
+```sh
+for c in 1 4 8 16 32 64 128; do
   ghz --insecure \
     --proto ./src/proto/kcache.proto \
     --call kcache.pb.KCache/Get \
     --data '{"group":"default","key":"Tom"}' \
     --connections=4 --concurrency=$c \
-    --duration=60s --skipFirst=1000 \
+    --duration=20s --skipFirst=500 \
     localhost:8001
 done
 ```

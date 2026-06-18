@@ -241,17 +241,18 @@ TEST_F(CircuitBreakerGroupTest, StaleDataServedWhenGetterFails) {
     cfg.failure_threshold = 3;
     cfg.recovery_timeout_ms = 60000;
 
-    KCacheGroup group("grp_stale", 1024, MakeGetter(), nullptr, cfg, 3000, 0);
+    // cache_ttl_ms=30ms：主缓存过期后强制走回源；stale_ttl_ms=0：stale 不过期。
+    KCacheGroup group("grp_stale", 1024, MakeGetter(), nullptr, cfg, 3000, 0, 30, 0);
 
     // 先成功获取，写入 stale cache
     auto r1 = group.Get("k1");
     ASSERT_TRUE(r1.has_value());
     EXPECT_EQ(r1->ToString(), "v1");
 
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
     // 模拟后端故障（抛异常 = 数据库连接失败）
     getter_throws_ = true;
-    // 清除主缓存，强制回源
-    group.Delete("k1");
 
     // 连续失败触发熔断
     for (int i = 0; i < 3; ++i) {
@@ -260,10 +261,29 @@ TEST_F(CircuitBreakerGroupTest, StaleDataServedWhenGetterFails) {
     EXPECT_EQ(group.CircuitBreakerState(), "Open");
 
     // 熔断后，stale cache 兜底
-    group.Delete("k1");  // 清主缓存，确保走 Load
     auto r2 = group.Get("k1");
     ASSERT_TRUE(r2.has_value());
     EXPECT_EQ(r2->ToString(), "v1");  // 来自 stale cache
+}
+
+// stale cache 有独立 TTL，超过兜底窗口后不再返回旧值
+TEST_F(CircuitBreakerGroupTest, StaleDataExpiresAfterStaleTTL) {
+    CircuitBreakerConfig cfg;
+    cfg.failure_threshold = 1;
+    cfg.recovery_timeout_ms = 60000;
+
+    // 主缓存 20ms 过期，stale cache 40ms 过期。
+    KCacheGroup group("grp_stale_ttl", 1024, MakeGetter(), nullptr, cfg, 3000, 0, 20, 40);
+
+    auto r1 = group.Get("k1");
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_EQ(r1->ToString(), "v1");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+    getter_throws_ = true;
+    auto r2 = group.Get("k1");
+    EXPECT_FALSE(r2.has_value());
 }
 
 // 熔断恢复：Open -> HalfOpen -> Closed
