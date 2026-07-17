@@ -313,6 +313,32 @@ TEST_F(CircuitBreakerGroupTest, BreakerRecovery) {
     EXPECT_EQ(group.CircuitBreakerState(), "Closed");
 }
 
+// SingleFlight 冷却期拒绝新回源时，应走降级但不能被熔断器当作成功。
+// 尤其在 HalfOpen 探测阶段，冷却拒绝不是后端恢复信号，不能误关闭熔断器。
+TEST_F(CircuitBreakerGroupTest, SingleFlightCooldownRejectedDoesNotCloseHalfOpenBreaker) {
+    CircuitBreakerConfig cfg;
+    cfg.failure_threshold = 1;
+    cfg.recovery_timeout_ms = 30;
+    cfg.success_threshold = 1;
+    cfg.half_open_max_calls = 1;
+    getter_throws_ = true;
+
+    KCacheGroup group("grp_cooldown_halfopen", 1024, MakeGetter(), MakeFallback(),
+                      cfg, 3000, 300);
+
+    auto r1 = group.Get("k1");
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_EQ(r1->ToString(), "fallback_value");
+    EXPECT_EQ(group.CircuitBreakerState(), "Open");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    auto r2 = group.Get("k1");
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(r2->ToString(), "fallback_value");
+    EXPECT_EQ(group.CircuitBreakerState(), "HalfOpen");
+}
+
 // ─── 安全性测试：合法 nullopt 不触发熔断（防恶意攻击） ────────────────
 
 // 核心安全修复验证：getter 正常返回 nullopt（数据库中不存在该 key）
@@ -449,4 +475,39 @@ TEST_F(CircuitBreakerGroupTest, RepeatedTimeoutOpensBreaker) {
     // 修复后应接近 3 * 50ms 返回，这里保留调度余量。
     EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), 700);
     EXPECT_EQ(group.GetStatus().getter_timeouts.load(), 3);
+}
+
+// 同一 key 的先锋线程超时只应计一次熔断失败，等待线程共享失败结果但不重复累计 breaker
+TEST_F(CircuitBreakerGroupTest, WaiterTimeoutsDoNotMultiplyBreakerFailures) {
+    CircuitBreakerConfig cfg;
+    cfg.failure_threshold = 2;  // 若等待线程重复计数，本次并发会直接把 breaker 打开
+    cfg.recovery_timeout_ms = 60000;
+
+    DataGetter slow_getter = [](const std::string& key) -> ByteViewOptional {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        return ByteView{"late_value"};
+    };
+
+    FallbackGetter fallback = [](const std::string& key) -> ByteViewOptional {
+        return ByteView{"fallback"};
+    };
+
+    KCacheGroup group("grp_waiter_timeout_breaker", 1024, slow_getter, fallback, cfg, 50, 0);
+
+    constexpr int kThreads = 6;
+    std::vector<std::thread> ths;
+    std::vector<bool> ok(kThreads, false);
+    ths.reserve(kThreads);
+
+    for (int i = 0; i < kThreads; ++i) {
+        ths.emplace_back([&, i] {
+            auto r = group.Get("hot_key");
+            ok[i] = r.has_value() && r->ToString() == "fallback";
+        });
+    }
+    for (auto& t : ths) t.join();
+
+    for (bool v : ok) EXPECT_TRUE(v);
+    EXPECT_EQ(group.GetStatus().getter_timeouts.load(), 1);
+    EXPECT_EQ(group.CircuitBreakerState(), "Closed");
 }

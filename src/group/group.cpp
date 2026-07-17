@@ -205,7 +205,9 @@ auto KCacheGroup::Load(const std::string& key) -> ByteViewOptional {
     status_.load_duration += load_ns;
     // 1.真故障处理
     if (ret.is_error) {
-        breaker_->RecordFailure();
+        if (ret.should_trip_breaker) {
+            breaker_->RecordFailure();
+        }
         spdlog::error("Failed to load data for key: {}", key);
         // getter 真故障（超时/异常/数据库连接失败），走降级
         return Fallback(key);
@@ -245,15 +247,15 @@ auto KCacheGroup::LoadData(const std::string& key) -> SingleFlightResult {
             auto val = getter_(key);
             if (!val) {
                 // getter 正常返回但未找到数据：NOT_FOUND，不是错误
-                return {std::nullopt, false}; // 未找到，非异常
+                return {std::nullopt, false, SingleFlightErrorSource::None, false}; // 未找到，非异常
             }
             // 回源命中由上层 Load() 统一记入 loader_hits，这里不再误记为 local_hits
-            return {val, false};
+            return {val, false, SingleFlightErrorSource::None, false};
         } catch (...) {
             // getter 抛异常：真正的数据库故障
             ++status_.loader_errors;
             spdlog::error("[{}] getter exception for key={}", name_, key);
-            return {std::nullopt, true};
+            return {std::nullopt, true, SingleFlightErrorSource::PioneerFailure, true};
         }
     }
 
@@ -283,7 +285,7 @@ auto KCacheGroup::LoadData(const std::string& key) -> SingleFlightResult {
                 // getter 正常完成时，把结果交给等待中的 LoadData()。
                 // 如果 LoadData() 已经因为超时返回，promise 仍然可以安全接收这个结果；
                 // 只是结果不会再被当前请求使用。
-                prom->set_value({val, false}); // 包装成 SingleFlightResult;
+                prom->set_value({val, false, SingleFlightErrorSource::None, false});
             } catch (...) {
                 // getter 抛出的异常不能跨线程自动传播，必须写入 promise。
                 // 如果主线程仍在等待，fut.get() 会重新抛出；如果已经超时返回，
@@ -293,7 +295,7 @@ auto KCacheGroup::LoadData(const std::string& key) -> SingleFlightResult {
         }).detach();
     } catch (const std::system_error& e) {
         spdlog::error("[{}] failed to start getter worker for key={}: {}", name_, key, e.what());
-        return {std::nullopt, true}; // 启动额外线程失败，属于error
+        return {std::nullopt, true, SingleFlightErrorSource::PioneerFailure, true};
     }
 
     // 只在当前请求线程等待 timeout 时长；后台 getter 若更慢，会继续在 detached thread 中运行。
@@ -304,7 +306,7 @@ auto KCacheGroup::LoadData(const std::string& key) -> SingleFlightResult {
             auto result = fut.get();
             if (!result.data) {
                 // getter 正常返回 nullopt：数据不存在，不是错误
-                return {std::nullopt, false};
+                return {std::nullopt, false, SingleFlightErrorSource::None, false};
             }
             // 回源命中由上层 Load() 统一记入 loader_hits，这里不再误记为 local_hits
             return result;
@@ -312,7 +314,7 @@ auto KCacheGroup::LoadData(const std::string& key) -> SingleFlightResult {
             // getter 在 detached 线程中抛异常：真正的数据库故障
             ++status_.loader_errors;
             spdlog::error("[{}] getter exception for key={}", name_, key);
-            return {std::nullopt, true};
+            return {std::nullopt, true, SingleFlightErrorSource::PioneerFailure, true};
         }
     }
 
@@ -322,7 +324,7 @@ auto KCacheGroup::LoadData(const std::string& key) -> SingleFlightResult {
     // 同时 SingleFlight::Do() 会把 nullopt 广播给仍在等待该 key 的线程。
     ++status_.getter_timeouts;
     spdlog::warn("[{}] getter timeout for key={} (timeout={}ms)", name_, key, getter_timeout_ms_);
-    return {std::nullopt, true}; // 超时属于error
+    return {std::nullopt, true, SingleFlightErrorSource::PioneerFailure, true};
 }
 
 }  // namespace kcache

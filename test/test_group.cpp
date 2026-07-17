@@ -215,7 +215,8 @@ TEST(SingleFlightTest, WaiterTimeoutForgetsStalledCall) {
                 }
                 return {ByteView{"late_value"}, false}; 
             },
-            std::chrono::milliseconds(50));
+            std::chrono::milliseconds(50),
+            std::chrono::milliseconds::zero());
     });
 
     if (pioneer_started.wait_for(std::chrono::milliseconds(200)) != std::future_status::ready) {
@@ -236,7 +237,8 @@ TEST(SingleFlightTest, WaiterTimeoutForgetsStalledCall) {
             []() -> SingleFlightResult {
                 return {ByteView{"waiter_should_not_run"}, false};
             },
-            std::chrono::milliseconds(50));
+            std::chrono::milliseconds(50),
+            std::chrono::milliseconds::zero());
         waiter_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start);
         waiter_done.store(true);
@@ -257,7 +259,8 @@ TEST(SingleFlightTest, WaiterTimeoutForgetsStalledCall) {
         []() -> SingleFlightResult {
             return {ByteView{"retry_value"}, false};
         },
-        std::chrono::milliseconds(50));
+        std::chrono::milliseconds(50),
+        std::chrono::milliseconds::zero());
 
     release_pioneer.store(true);
     pioneer.join();
@@ -265,6 +268,8 @@ TEST(SingleFlightTest, WaiterTimeoutForgetsStalledCall) {
     // 【修改 6】：断言需要访问 .data 字段来判断是否有值
     EXPECT_FALSE(waiter_result.data.has_value());
     EXPECT_TRUE(waiter_result.is_error); // 等待线程超时退出，根据你的设计 is_error 为 true
+    EXPECT_EQ(waiter_result.error_source, SingleFlightErrorSource::PioneerFailure);
+    EXPECT_TRUE(waiter_result.should_trip_breaker);
     EXPECT_LT(waiter_elapsed.count(), 150);
     EXPECT_EQ(pioneer_runs.load(), 1);
 
@@ -273,6 +278,57 @@ TEST(SingleFlightTest, WaiterTimeoutForgetsStalledCall) {
 
     ASSERT_TRUE(pioneer_result.data.has_value());
     EXPECT_EQ(pioneer_result.data->ToString(), "late_value");
+}
+
+// 等待线程先观察到先锋卡住时，本轮 singleflight 失败只应上报一次；
+// 之后先锋线程即使返回真实失败，也不能再次触发 breaker 计数。
+TEST(SingleFlightTest, WaiterTimeoutReportsPioneerFailureOnlyOnce) {
+    SingleFlight loader;
+    std::atomic_bool release_pioneer{false};
+    std::promise<void> pioneer_started_signal;
+    auto pioneer_started = pioneer_started_signal.get_future();
+
+    SingleFlightResult pioneer_result;
+    std::thread pioneer([&] {
+        pioneer_result = loader.Do(
+            "hot_failure",
+            [&]() -> SingleFlightResult {
+                pioneer_started_signal.set_value();
+                while (!release_pioneer.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                return {std::nullopt, true, SingleFlightErrorSource::PioneerFailure, true};
+            },
+            std::chrono::milliseconds(30),
+            std::chrono::milliseconds::zero());
+    });
+
+    if (pioneer_started.wait_for(std::chrono::milliseconds(200)) != std::future_status::ready) {
+        release_pioneer.store(true);
+        pioneer.join();
+        FAIL() << "pioneer call did not start in time";
+    }
+
+    auto waiter_result = loader.Do(
+        "hot_failure",
+        []() -> SingleFlightResult {
+            return {ByteView{"waiter_should_not_run"}, false};
+        },
+        std::chrono::milliseconds(30),
+        std::chrono::milliseconds::zero());
+
+    EXPECT_FALSE(waiter_result.data.has_value());
+    EXPECT_TRUE(waiter_result.is_error);
+    EXPECT_EQ(waiter_result.error_source, SingleFlightErrorSource::PioneerFailure);
+    EXPECT_TRUE(waiter_result.should_trip_breaker);
+
+    release_pioneer.store(true);
+    pioneer.join();
+
+    EXPECT_FALSE(pioneer_result.data.has_value());
+    EXPECT_TRUE(pioneer_result.is_error);
+    EXPECT_EQ(pioneer_result.error_source, SingleFlightErrorSource::PioneerFailure);
+    EXPECT_FALSE(pioneer_result.should_trip_breaker);
 }
 
 // 移动构造后，已缓存的值仍可直接命中，不重复回源

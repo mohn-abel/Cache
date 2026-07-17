@@ -3,6 +3,7 @@
 #ifndef SINGLEFLIGHT_H_
 #define SINGLEFLIGHT_H_
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <future>
@@ -16,9 +17,18 @@
 
 namespace kcache {
 
+enum class SingleFlightErrorSource {
+    None,
+    PioneerFailure,  // 真实回源失败，应该计入 breaker failure
+    WaiterTimeout,   // 等待线程自己超时，只应降级，不应重复计 breaker
+    CooldownRejected, // 失败冷却期内拒绝新回源，只降级，不重复计 breaker
+};
+
 struct SingleFlightResult {
     std::optional<ByteView> data = std::nullopt;
     bool is_error = false; // 记录是否发生真正的底层故障
+    SingleFlightErrorSource error_source = SingleFlightErrorSource::None;
+    bool should_trip_breaker = false; // 只有真实执行回源的先锋线程失败才应计 breaker
 };
 
 class SingleFlight {
@@ -61,7 +71,7 @@ public:
             if (auto fit = failed_keys_.find(key); fit != failed_keys_.end()) {
                 if (now - fit->second < fail_cooldown) {
                     glock.unlock();
-                    return {std::nullopt, false}; // 冷却期内，直接降级
+                    return {std::nullopt, true, SingleFlightErrorSource::CooldownRejected, false}; // 冷却期内，直接降级
                 }
                 failed_keys_.erase(fit); // 冷却期已过，允许重试
             }
@@ -100,12 +110,15 @@ public:
 
         try {
             Result val = func();
+            if (val.is_error && val.should_trip_breaker) {
+                val.should_trip_breaker = MarkFailureOnce(key, new_call);
+            }
             // 先锋线程正常完成：把结果写入 promise，所有正在等待 fut 的线程都会被唤醒。
             // val 可以是 nullopt，表示回源失败；上层会根据 nullopt 走 fallback。
             // ★ 安全修复：不再对 clean nullopt 调用 MarkFailed。
             // LoadData 已经通过 is_error 出参区分"数据不存在"与"真故障"，
             // clean nullopt 是正常的业务语义（key 不存在），不应触发冷却期。
-            // 只有下面 catch 块中的异常才代表真正的回源故障，需要冷却。
+            // 只有真故障（is_error && should_trip_breaker）才会进入失败冷却。
             new_call->prom.set_value(val);
             return val;
         } catch (...) {
@@ -114,9 +127,9 @@ public:
             //
             // 等待线程拿到异常后会在 WaitForResult() 中统一转换为 nullopt，
             // 让上层 Load() 继续按"回源失败"处理。
-            MarkFailed(key); // ★ getter 抛异常 → 加入冷却名单
+            const bool should_trip_breaker = MarkFailureOnce(key, new_call);
             new_call->prom.set_exception(std::current_exception());
-            return {std::nullopt, true}; // 统一返回 nullopt，上层 Load() 走熔断 + Fallback
+            return {std::nullopt, true, SingleFlightErrorSource::PioneerFailure, should_trip_breaker};
         }
     }
 
@@ -124,6 +137,7 @@ private:
     struct Call {
         std::promise<Result> prom;          // 先锋线程的结果广播器
         std::shared_future<Result> fut = prom.get_future().share(); // 收音机线程的结果接收器
+        std::atomic_bool failure_reported{false}; // 本轮 singleflight 是否已上报过真实失败
     };
     // 等待线程读取先锋线程结果。
     Result WaitForResult(const std::string& key, const std::shared_ptr<Call>& call,
@@ -137,17 +151,23 @@ private:
             // 把同 key 的后续请求全部永久拖住。
             if (wait_timeout.count() > 0 &&
                 call->fut.wait_for(wait_timeout) != std::future_status::ready) {
+                const bool should_trip_breaker = MarkFailureOnce(key, call);
                 Forget(key, call);
-                return {std::nullopt, true}; // 超时属于error
+                return {std::nullopt, true,
+                        should_trip_breaker ? SingleFlightErrorSource::PioneerFailure
+                                            : SingleFlightErrorSource::WaiterTimeout,
+                        should_trip_breaker};
             }
 
             // 没有设置等待超时，或先锋线程已经完成：读取共享结果。
             // 如果先锋线程 set_exception，这里会抛出，并在 catch 中转换为 nullopt。
-            return call->fut.get();
+            auto result = call->fut.get();
+            result.should_trip_breaker = false; // 等待线程复用先锋结果，不应重复累计 breaker
+            return result;
         } catch (...) {
             // 先锋线程失败（func 抛异常或上层超时返回 nullopt），收音机线程统一返回 nullopt，
             // 由上层 Load() 走熔断 + Fallback 降级。
-            return {std::nullopt, true}; // 异常属于error
+            return {std::nullopt, true, SingleFlightErrorSource::PioneerFailure, false};
         }
     }
 
@@ -162,10 +182,22 @@ private:
         }
     }
 
+    // 同一轮 singleflight 真实失败只允许上报一次：
+    // - 先锋线程先返回失败：先锋线程上报；
+    // - 先锋线程卡住：第一个等待超时的线程代表本轮调用失败并上报；
+    // - 后续等待线程或迟到的先锋线程只降级，不重复累计 breaker。
+    bool MarkFailureOnce(const std::string& key, const std::shared_ptr<Call>& call) {
+        if (!call->failure_reported.exchange(true, std::memory_order_acq_rel)) {
+            MarkFailed(key);
+            return true;
+        }
+        return false;
+    }
+
     // ★ 标记 key 回源失败，将其加入冷却名单。
     // 冷却期内同一 key 的新请求不会再创建先锋线程。
     void MarkFailed(const std::string& key) {
-        // 调用方已持有 mtx_，无需再次加锁
+        std::lock_guard<std::mutex> lock(mtx_);
         failed_keys_[key] = std::chrono::steady_clock::now();
     }
 
